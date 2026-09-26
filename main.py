@@ -1,4 +1,6 @@
 # coding:utf-8
+import ctypes
+import subprocess
 import sys
 import threading
 import appdirs
@@ -16,6 +18,7 @@ from qfluentwidgets import FluentIcon as FIF
 
 from function import get_resource_path
 from home_Interface import HomeInterface
+from recording_Interface import RecordingInterface
 from setting_Interface import SettingInterface
 from info_Interface import InfoInterface
 
@@ -25,7 +28,7 @@ from backend.hwnd_check_thread import start_thread as hwnd_check_thread, cpu_che
 
 _translate = QtCore.QCoreApplication.translate
 
-Version = '1.0000'
+Version = '1.0.1'
 app_name = "Sky_better_chords"
 app_author = "Lvtiansama"
 # 获取用户缓存目录
@@ -65,6 +68,7 @@ class Window(MSFluentWindow):
 
         # create sub interface
         self.homeInterface = HomeInterface(self)
+        self.recordingInterface = RecordingInterface(self)
         self.settingInterface = SettingInterface(self)
         self.infoInterface = InfoInterface(self)
 
@@ -106,7 +110,8 @@ class Window(MSFluentWindow):
 
     def initNavigation(self):
         self.addSubInterface(self.homeInterface, FIF.HOME, _translate("main", '主页'), FIF.HOME_FILL)
-        self.addSubInterface(self.settingInterface, FIF.SETTING, _translate("main", '设置'), FIF.SETTING)
+        self.addSubInterface(self.recordingInterface, FIF.MUSIC, _translate("main", '录制'), FIF.MUSIC)
+        self.addSubInterface(self.settingInterface, FIF.SETTING, _translate("main", '映射设置'), FIF.SETTING)
 
         self.addSubInterface(self.infoInterface, FIF.INFO, _translate("main", '关于'), FIF.INFO, NavigationItemPosition.BOTTOM)
         self.navigationInterface.addItem(
@@ -121,7 +126,7 @@ class Window(MSFluentWindow):
         self.navigationInterface.setCurrentItem(self.homeInterface.objectName())
 
     def initWindow(self):
-        self.resize(1000, 600)
+        self.resize(1000, 660)
         self.setWindowIcon(QIcon(get_resource_path('icon.ico')))
         self.setWindowTitle(app_name)
 
@@ -133,7 +138,34 @@ class Window(MSFluentWindow):
         toggleTheme()
 
 
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def request_admin():
+    if getattr(sys, 'frozen', False):
+        executable = sys.executable
+        parameters = subprocess.list2cmdline(sys.argv[1:])
+    else:
+        executable = sys.executable
+        parameters = subprocess.list2cmdline([os.path.abspath(sys.argv[0])] + sys.argv[1:])
+    result = ctypes.windll.shell32.ShellExecuteW(
+        None, "runas", executable, parameters, os.getcwd(), 1)
+    return result > 32
+
+
 if __name__ == '__main__':
+    if not is_admin():
+        if request_admin():
+            sys.exit(0)
+        ctypes.windll.user32.MessageBoxW(
+            0, "本程序需要管理员权限才能向游戏发送按键，请以管理员身份运行。",
+            app_name, 0x10)
+        sys.exit(1)
+
     setTheme(Theme.AUTO)
     setThemeColor('#8569BE')
 
