@@ -28,7 +28,7 @@ from backend.hwnd_check_thread import start_thread as hwnd_check_thread, cpu_che
 
 _translate = QtCore.QCoreApplication.translate
 
-Version = '1.0.1'
+Version = '1.0.2'
 app_name = "Sky_better_chords"
 app_author = "Lvtiansama"
 # 获取用户缓存目录

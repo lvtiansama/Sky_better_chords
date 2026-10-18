@@ -1,21 +1,24 @@
 # coding:utf-8
 import json
 import os
+import random
+import time
 
 from PyQt6 import QtCore
-from PyQt6.QtCore import QEvent, Qt, QTimer
+from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer
 from PyQt6.QtWidgets import QFileDialog, QWidget
-from qfluentwidgets import (FluentIcon as FIF, InfoBar, InfoBarPosition,
-                            MessageBox)
+from qfluentwidgets import (FluentIcon as FIF, Flyout, FlyoutAnimationType,
+                            InfoBar, InfoBarPosition, MessageBox, ToolTipFilter)
 
 from config import global_keydist_realtime
 from backend.global_variable import GlobalVariable
 from ui.recording import (ID_TO_INDEX, ID_TO_PHYSICAL, INDEX_TO_ID,
-                          PHYSICAL_TO_ID, Ui_recording)
+                          NOTE_NEIGHBORS, PHYSICAL_TO_ID, Ui_recording)
 
 _translate = QtCore.QCoreApplication.translate
 
 CHORD_WINDOW_MS = 40
+MAX_JITTER_MS = 60000
 
 
 class RecordingInterface(Ui_recording, QWidget):
@@ -29,6 +32,12 @@ class RecordingInterface(Ui_recording, QWidget):
         self.score_name = None
         self._press_ms = 100
         self._gap_ms = 150
+        self._delay_min_ms = 0
+        self._delay_max_ms = 0
+        self._manual_countdown = None
+        self._playing = False
+        self._last_interval_ms = 0
+        self._humanize_hidden_at = 0.0
         self.pending_keys = []
         self._syncing_slider = False
         self._play_end = 0
@@ -37,6 +46,7 @@ class RecordingInterface(Ui_recording, QWidget):
         self.chord_timer.setSingleShot(True)
         self.chord_timer.timeout.connect(self._flush_pending)
         self.play_timer = QTimer(self)
+        self.play_timer.setSingleShot(True)
         self.play_timer.timeout.connect(self._on_play_tick)
         self.active_targets = None
         self.release_timer = QTimer(self)
@@ -50,6 +60,19 @@ class RecordingInterface(Ui_recording, QWidget):
         self.notes_per_bar.valueChanged.connect(self._on_notes_per_bar_changed)
         self.press_duration.editingFinished.connect(self._on_timing_edited)
         self.gap_duration.editingFinished.connect(self._on_timing_edited)
+        self.delay_min_duration.editingFinished.connect(self._on_humanize_edited)
+        self.delay_max_duration.editingFinished.connect(self._on_humanize_edited)
+        self.manual_error_button.clicked.connect(self._on_manual_error_clicked)
+        self.humanize_button.clicked.connect(self._on_humanize_toggle)
+        self.humanizeFlyout = Flyout(
+            self.humanizeView, self.window(), isDeleteOnClose=False)
+        self.humanizeFlyout.closed.connect(self._on_humanize_closed)
+        for widget in (self.delay_min_duration, self.delay_max_duration,
+                       self.auto_error_switch, self.accuracy_spin,
+                       self.manual_columns, self.manual_error_button,
+                       self.humanize_button, self.add_columns_edit,
+                       self.add_button, self.remove_button):
+            widget.installEventFilter(ToolTipFilter(widget, showDelay=300))
         self.slider.valueChanged.connect(self._on_slider_changed)
         self.to_start_button.clicked.connect(self._on_to_start)
         self.prev_button.clicked.connect(self._on_prev)
@@ -113,6 +136,7 @@ class RecordingInterface(Ui_recording, QWidget):
         self.chord_timer.stop()
         self.pending_keys = []
         self._release_active()
+        self.humanizeFlyout.close()
         super().hideEvent(event)
 
     def pushButtonoffinfo(self):
@@ -158,7 +182,9 @@ class RecordingInterface(Ui_recording, QWidget):
         self.score_name_label.setText(_translate("recording", "乐谱：{}").format(name))
         self.column_count_label.setText(
             _translate("recording", "共 {} 列").format(len(self.notes)))
-        seconds = int(round(len(self.notes) * self._gap_ms / 1000.0))
+        low, high = self._delay_bounds()
+        average_gap = self._gap_ms + (low + high) / 2.0
+        seconds = int(round(len(self.notes) * average_gap / 1000.0))
         minutes, sec = divmod(seconds, 60)
         self.duration_label.setText(
             _translate("recording", "预估时长：{}:{:02d}").format(minutes, sec))
@@ -233,8 +259,15 @@ class RecordingInterface(Ui_recording, QWidget):
 
     def _on_add_column(self):
         self._flush_pending()
-        self.current_index += 1
-        self.notes.insert(self.current_index, [])
+        try:
+            count = int(self.add_columns_edit.text().strip())
+        except ValueError:
+            count = 1
+        count = max(1, min(999, count))
+        self.add_columns_edit.setText(str(count))
+        insert_at = self.current_index + 1
+        self.notes[insert_at:insert_at] = [[] for _ in range(count)]
+        self.current_index += count
         self._refresh()
 
     def _on_delete_column(self):
@@ -266,12 +299,18 @@ class RecordingInterface(Ui_recording, QWidget):
         if self.current_index >= self._play_end:
             self.current_index = 0
             self._refresh()
-        self.play_timer.start(max(10, self._gap_ms))
+        self._playing = True
+        self._reset_manual_button()
+        self._last_interval_ms = self._next_interval()
+        self.play_timer.start(self._last_interval_ms)
         self.play_button.setIcon(FIF.PAUSE)
         self.play_button.setText(_translate("recording", "暂停"))
 
     def _stop_play(self):
         self.play_timer.stop()
+        self._playing = False
+        self._reset_manual_button()
+        self.beat_status_label.setText(_translate("recording", "本拍实际延迟 --"))
         self.play_button.setIcon(FIF.PLAY)
         self.play_button.setText(_translate("recording", "播放"))
 
@@ -280,13 +319,29 @@ class RecordingInterface(Ui_recording, QWidget):
             self._stop_play()
             return
         self._refresh()
+        interval = self._last_interval_ms
         column = self.notes[self.current_index]
+        error_occurred = False
         if column:
-            self._send_note_signal(column)
-        if self.current_index + 1 >= self._play_end:
+            force_error = self._consume_manual_error()
+            play_column = column
+            if force_error or self._auto_error_wanted():
+                play_column = self._make_error_column(column)
+                error_occurred = play_column != column
+            self._send_note_signal(play_column)
+        self._update_beat_status(interval, error_occurred)
+        self.current_index += 1
+        if self.current_index >= self._play_end:
             self._stop_play()
             return
-        self.current_index += 1
+        self._last_interval_ms = self._next_interval()
+        self.play_timer.start(self._last_interval_ms)
+
+    def _update_beat_status(self, delay_ms, error_occurred):
+        text = _translate("recording", "本拍实际延迟 {}ms").format(delay_ms)
+        if error_occurred:
+            text += _translate("recording", " · 错音")
+        self.beat_status_label.setText(text)
 
     def _robot_functions(self):
         if GlobalVariable.cpu_type == 'AMD':
@@ -379,6 +434,140 @@ class RecordingInterface(Ui_recording, QWidget):
             self.gap_duration.setText(str(self._gap_ms))
         self._update_stats()
 
+    def _delay_bounds(self):
+        low = max(0, min(MAX_JITTER_MS, self._delay_min_ms))
+        high = max(0, min(MAX_JITTER_MS, self._delay_max_ms))
+        if low > high:
+            low, high = high, low
+        return low, high
+
+    def _next_interval(self):
+        low, high = self._delay_bounds()
+        jitter = random.randint(low, high) if high > 0 else 0
+        return max(10, self._gap_ms + jitter)
+
+    def _on_humanize_edited(self):
+        low = max(0, min(MAX_JITTER_MS, self._parse_ms(
+            self.delay_min_duration, self._delay_min_ms)))
+        high = max(0, min(MAX_JITTER_MS, self._parse_ms(
+            self.delay_max_duration, self._delay_max_ms)))
+        if low > high:
+            low, high = high, low
+        self._delay_min_ms = low
+        self._delay_max_ms = high
+        self.delay_min_duration.setText(str(low))
+        self.delay_max_duration.setText(str(high))
+        self._update_stats()
+
+    def _on_humanize_toggle(self):
+        if time.monotonic() - self._humanize_hidden_at < 0.2:
+            return
+        if self.humanizeFlyout.isVisible():
+            self.humanizeFlyout.close()
+            return
+        self.humanizeFlyout.exec(
+            self._humanize_flyout_position(), FlyoutAnimationType.DROP_DOWN)
+
+    def _humanize_flyout_position(self):
+        position = self.humanize_button.mapToGlobal(
+            QPoint(0, self.humanize_button.height()))
+        x = position.x() + self.humanize_button.width() // 2 \
+            - self.humanizeFlyout.sizeHint().width() // 2
+        y = position.y() - self.humanizeFlyout.layout().contentsMargins().top() + 8
+        return QPoint(x, y)
+
+    def _on_humanize_closed(self):
+        self._humanize_hidden_at = time.monotonic()
+
+    def _auto_error_wanted(self):
+        if not self.auto_error_switch.isChecked():
+            return False
+        return random.random() * 100 >= self.accuracy_spin.value()
+
+    def _neighbor_note(self, note, used):
+        candidates = [item for item in NOTE_NEIGHBORS.get(note, []) if item not in used]
+        return random.choice(candidates) if candidates else None
+
+    def _apply_error(self, error_type, notes):
+        if error_type == "miss" and len(notes) >= 2:
+            result = list(notes)
+            del result[random.randrange(len(result))]
+            return result
+        used = set(notes)
+        order = list(range(len(notes)))
+        random.shuffle(order)
+        if error_type == "wrong":
+            for index in order:
+                replacement = self._neighbor_note(notes[index], used)
+                if replacement:
+                    result = list(notes)
+                    result[index] = replacement
+                    return result
+        elif error_type == "multi":
+            for index in order:
+                extra = self._neighbor_note(notes[index], used)
+                if extra:
+                    return list(notes) + [extra]
+        return None
+
+    def _make_error_column(self, column):
+        notes = list(column)
+        if not notes:
+            return notes
+        error_types = ["wrong", "multi"]
+        if len(notes) >= 2:
+            error_types.append("miss")
+        random.shuffle(error_types)
+        for error_type in error_types:
+            result = self._apply_error(error_type, notes)
+            if result is not None:
+                return result
+        return notes
+
+    def _reset_manual_button(self):
+        self._manual_countdown = None
+        self.manual_error_button.setEnabled(True)
+        self.manual_error_button.setText(_translate("recording", "随机错音"))
+
+    def _consume_manual_error(self):
+        if self._manual_countdown is None:
+            return False
+        self._manual_countdown -= 1
+        if self._manual_countdown > 0:
+            self.manual_error_button.setText(
+                _translate("recording", "第 {} 列后错音").format(self._manual_countdown))
+            return False
+        self._reset_manual_button()
+        return True
+
+    def _on_manual_error_clicked(self):
+        if not self._playing:
+            InfoBar.warning(
+                title=_translate("recording", "手动错音"),
+                content=_translate("recording", "请先开始播放"),
+                isClosable=False,
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=2000,
+                parent=self
+            )
+            return
+        if self._manual_countdown is not None:
+            return
+        limit = max(1, self.manual_columns.value())
+        countdown = random.randint(1, limit)
+        self._manual_countdown = countdown
+        self.manual_error_button.setEnabled(False)
+        self.manual_error_button.setText(
+            _translate("recording", "第 {} 列后错音").format(countdown))
+        InfoBar.info(
+            title=_translate("recording", "手动错音"),
+            content=_translate("recording", "将在 {} 列后触发错音").format(countdown),
+            isClosable=False,
+            position=InfoBarPosition.TOP_RIGHT,
+            duration=2000,
+            parent=self
+        )
+
     def _on_new(self):
         box = MessageBox(
             _translate("recording", "新建乐谱"),
@@ -398,11 +587,19 @@ class RecordingInterface(Ui_recording, QWidget):
         self.notes_per_bar.setValue(8)
         self.press_duration.setText("100")
         self.gap_duration.setText("150")
+        self.delay_min_duration.setText("0")
+        self.delay_max_duration.setText("0")
+        self.auto_error_switch.setChecked(False)
+        self.accuracy_spin.setValue(95)
+        self.manual_columns.setValue(3)
+        self.add_columns_edit.setText("1")
         self._validate_timing()
+        self._on_humanize_edited()
         self._refresh()
 
     def _on_save(self):
         self._validate_timing()
+        self._on_humanize_edited()
         path, _ = QFileDialog.getSaveFileName(
             self, _translate("recording", "保存乐谱"), "", "JSON (*.json)")
         if not path:
@@ -414,6 +611,13 @@ class RecordingInterface(Ui_recording, QWidget):
             "press_duration_ms": self._press_ms,
             "gap_ms": self._gap_ms,
             "notes": self.notes,
+            "humanize": {
+                "delay_min_ms": self._delay_min_ms,
+                "delay_max_ms": self._delay_max_ms,
+                "auto_error": self.auto_error_switch.isChecked(),
+                "accuracy": self.accuracy_spin.value(),
+                "manual_columns": self.manual_columns.value(),
+            },
         }
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -463,7 +667,14 @@ class RecordingInterface(Ui_recording, QWidget):
         self.notes_per_bar.setValue(int(data.get("notes_per_bar", 8)))
         self.press_duration.setText(str(int(data.get("press_duration_ms", self._press_ms))))
         self.gap_duration.setText(str(int(data.get("gap_ms", self._gap_ms))))
+        humanize = data.get("humanize", {})
+        self.delay_min_duration.setText(str(int(humanize.get("delay_min_ms", 0))))
+        self.delay_max_duration.setText(str(int(humanize.get("delay_max_ms", 0))))
+        self.auto_error_switch.setChecked(bool(humanize.get("auto_error", False)))
+        self.accuracy_spin.setValue(int(humanize.get("accuracy", 95)))
+        self.manual_columns.setValue(int(humanize.get("manual_columns", 3)))
         self._validate_timing()
+        self._on_humanize_edited()
         self.current_index = 0
         self._ensure_column(0)
         self._refresh()
